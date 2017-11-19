@@ -55,8 +55,6 @@ else
 	endif
 endif
 
-include docker/Makefile
-
 .PHONY: all
 all: build
 
@@ -334,3 +332,5 @@ generate-images:
 					$(TMPDIR)/images/64.png $(TMPDIR)/images/128.png \
 					$(PWD)/public/img/favicon.ico
 	rm -rf $(TMPDIR)/images
+
+include docker/Makefile
