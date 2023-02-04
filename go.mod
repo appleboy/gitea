@@ -85,6 +85,7 @@ require (
 	github.com/pquerna/otp v1.4.0
 	github.com/prometheus/client_golang v1.14.0
 	github.com/quasoft/websspi v1.1.2
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/santhosh-tekuri/jsonschema/v5 v5.1.1
 	github.com/sergi/go-diff v1.2.0
 	github.com/shurcooL/vfsgen v0.0.0-20200824052919-0d455de96546
@@ -286,7 +287,7 @@ replace github.com/shurcooL/vfsgen => github.com/lunny/vfsgen v0.0.0-20220105142
 
 replace github.com/blevesearch/zapx/v15 v15.3.6 => github.com/zeripath/zapx/v15 v15.3.6-alignment-fix
 
-replace github.com/nektos/act => gitea.com/gitea/act v0.234.0
+replace github.com/nektos/act => gitea.com/gitea/act v0.234.1
 
 exclude github.com/gofrs/uuid v3.2.0+incompatible
 

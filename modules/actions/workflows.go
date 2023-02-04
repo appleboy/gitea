@@ -41,22 +41,23 @@ func ListWorkflows(commit *git.Commit) (git.Entries, error) {
 	return ret, nil
 }
 
-func DetectWorkflows(commit *git.Commit, event webhook_module.HookEventType) (map[string][]byte, error) {
+func DetectWorkflows(commit *git.Commit, event webhook_module.HookEventType) (map[string][]byte, map[string][]byte, error) {
 	entries, err := ListWorkflows(commit)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	workflows := make(map[string][]byte, len(entries))
+	schedules := make(map[string][]byte, len(entries))
 	for _, entry := range entries {
 		f, err := entry.Blob().DataAsync()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		content, err := io.ReadAll(f)
 		_ = f.Close()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		workflow, err := model.ReadWorkflow(bytes.NewReader(content))
 		if err != nil {
@@ -64,12 +65,16 @@ func DetectWorkflows(commit *git.Commit, event webhook_module.HookEventType) (ma
 			continue
 		}
 		for _, e := range workflow.On() {
+			log.Debug("name: %s, workflow event: %s, current event: %s", entry.Name(), e, event.Event())
 			if e == event.Event() {
 				workflows[entry.Name()] = content
-				break
+			}
+
+			if e == "schedule" {
+				schedules[entry.Name()] = content
 			}
 		}
 	}
 
-	return workflows, nil
+	return workflows, schedules, nil
 }

@@ -4,6 +4,7 @@
 package actions
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"code.gitea.io/gitea/services/convert"
 
 	"github.com/nektos/act/pkg/jobparser"
+	"github.com/nektos/act/pkg/model"
 )
 
 var methodCtxKey struct{}
@@ -101,40 +103,140 @@ func (input *notifyInput) Notify(ctx context.Context) {
 	}
 }
 
-func notify(ctx context.Context, input *notifyInput) error {
-	if input.Doer.IsActions() {
-		// avoiding triggering cyclically, for example:
-		// a comment of an issue will trigger the runner to add a new comment as reply,
-		// and the new comment will trigger the runner again.
-		log.Debug("ignore executing %v for event %v whose doer is %v", getMethod(ctx), input.Event, input.Doer.Name)
+func CreateScheduleTask(ctx context.Context, cron *actions_model.ActionSchedule, spec string) (int, error) {
+	return schedule.AddFunc(spec, func() {
+		log.Debug("================================================================")
+		log.Debug("current spec: %s", spec)
+		log.Debug("current title: %s", cron.Title)
+		log.Debug("current workflow: %s", cron.WorkflowID)
+		log.Debug("================================================================")
+		run := &actions_model.ActionRun{
+			Title:         cron.Title,
+			RepoID:        cron.RepoID,
+			OwnerID:       cron.OwnerID,
+			WorkflowID:    cron.WorkflowID,
+			TriggerUserID: cron.TriggerUserID,
+			Ref:           cron.Ref,
+			CommitSHA:     cron.CommitSHA,
+			Event:         cron.Event,
+			EventPayload:  cron.EventPayload,
+			Status:        actions_model.StatusWaiting,
+		}
+		jobs, err := jobparser.Parse(cron.Content)
+		if err != nil {
+			log.Error("jobparser.Parse: %v", err)
+			return
+		}
+		if err := actions_model.InsertRun(ctx, run, jobs); err != nil {
+			log.Error("InsertRun: %v", err)
+			return
+		}
+		if jobs, _, err := actions_model.FindRunJobs(ctx, actions_model.FindRunJobOptions{RunID: run.ID}); err != nil {
+			log.Error("FindRunJobs: %v", err)
+		} else {
+			for _, job := range jobs {
+				if err := CreateCommitStatus(ctx, job); err != nil {
+					log.Error("CreateCommitStatus: %v", err)
+				}
+			}
+		}
+	})
+}
+
+func handleSchedules(
+	ctx context.Context,
+	schedules map[string][]byte,
+	commit *git.Commit,
+	input *notifyInput,
+) error {
+	if commit.Branch != input.Repo.DefaultBranch {
+		log.Trace("commit branch is not default branch in repo")
 		return nil
 	}
-	if unit_model.TypeActions.UnitGlobalDisabled() {
+
+	rows, _, err := actions_model.FindSchedules(ctx, actions_model.FindScheduleOptions{RepoID: input.Repo.ID})
+	if err != nil {
+		log.Error("FindCrons: %v", err)
+	}
+
+	for _, row := range rows {
+		schedule.Remove(row.EntryIDs)
+	}
+
+	if len(rows) > 0 {
+		if err := actions_model.DeleteScheduleTaskByRepo(ctx, input.Repo.ID); err != nil {
+			log.Error("DeleteCronTaskByRepo: %v", err)
+		}
+	}
+
+	if len(schedules) == 0 {
+		log.Trace("repo %s with commit %s couldn't find schedules", input.Repo.RepoPath(), commit.ID)
 		return nil
 	}
-	if err := input.Repo.LoadUnits(ctx); err != nil {
-		return fmt.Errorf("repo.LoadUnits: %w", err)
-	} else if !input.Repo.UnitEnabled(ctx, unit_model.TypeActions) {
-		return nil
-	}
 
-	gitRepo, err := git.OpenRepository(context.Background(), input.Repo.RepoPath())
+	p, err := json.Marshal(input.Payload)
 	if err != nil {
-		return fmt.Errorf("git.OpenRepository: %w", err)
-	}
-	defer gitRepo.Close()
-
-	// Get the commit object for the ref
-	commit, err := gitRepo.GetCommit(input.Ref)
-	if err != nil {
-		return fmt.Errorf("gitRepo.GetCommit: %w", err)
+		return fmt.Errorf("json.Marshal: %w", err)
 	}
 
-	workflows, err := actions_module.DetectWorkflows(commit, input.Event)
-	if err != nil {
-		return fmt.Errorf("DetectWorkflows: %w", err)
+	crons := make([]*actions_model.ActionSchedule, 0)
+	for id, content := range schedules {
+		log.Debug("workflow: %s, content: %v", id, string(content))
+		// Check cron job condition. Only working in default branch
+		workflow, err := model.ReadWorkflow(bytes.NewReader(content))
+		if err != nil {
+			log.Error("ReadWorkflow: %v", err)
+			continue
+		}
+		schedules := workflow.OnSchedule()
+		if len(schedules) == 0 {
+			log.Warn("no schedule event")
+			continue
+		}
+		log.Debug("schedules: %#v", schedules)
+
+		crons = append(crons, &actions_model.ActionSchedule{
+			Title:         strings.SplitN(commit.CommitMessage, "\n", 2)[0],
+			RepoID:        input.Repo.ID,
+			OwnerID:       input.Repo.OwnerID,
+			WorkflowID:    id,
+			TriggerUserID: input.Doer.ID,
+			Ref:           input.Ref,
+			CommitSHA:     commit.ID.String(),
+			Event:         input.Event,
+			EventPayload:  string(p),
+			Specs:         schedules,
+			Content:       content,
+		})
 	}
 
+	if len(crons) > 0 {
+		for _, cron := range crons {
+			entryIDs := []int{}
+			for _, spec := range cron.Specs {
+				id, err := CreateScheduleTask(ctx, cron, spec)
+				if err != nil {
+					continue
+				}
+				entryIDs = append(entryIDs, id)
+			}
+			cron.EntryIDs = entryIDs
+		}
+
+		if err := actions_model.CreateScheduleTask(ctx, input.Repo.ID, crons); err != nil {
+			log.Error("CreateCronTask: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func handleWorkflows(
+	ctx context.Context,
+	workflows map[string][]byte,
+	commit *git.Commit,
+	input *notifyInput,
+) error {
 	if len(workflows) == 0 {
 		log.Trace("repo %s with commit %s couldn't find workflows", input.Repo.RepoPath(), commit.ID)
 		return nil
@@ -177,8 +279,57 @@ func notify(ctx context.Context, input *notifyInput) error {
 				}
 			}
 		}
-
 	}
+	return nil
+}
+
+func notify(ctx context.Context, input *notifyInput) error {
+	if input.Doer.IsActions() {
+		// avoiding triggering cyclically, for example:
+		// a comment of an issue will trigger the runner to add a new comment as reply,
+		// and the new comment will trigger the runner again.
+		log.Debug("ignore executing %v for event %v whose doer is %v", getMethod(ctx), input.Event, input.Doer.Name)
+		return nil
+	}
+	if unit_model.TypeActions.UnitGlobalDisabled() {
+		return nil
+	}
+	if err := input.Repo.LoadUnits(ctx); err != nil {
+		return fmt.Errorf("repo.LoadUnits: %w", err)
+	} else if !input.Repo.UnitEnabled(ctx, unit_model.TypeActions) {
+		return nil
+	}
+
+	gitRepo, err := git.OpenRepository(context.Background(), input.Repo.RepoPath())
+	if err != nil {
+		return fmt.Errorf("git.OpenRepository: %w", err)
+	}
+	defer gitRepo.Close()
+
+	// Get the commit object for the ref
+	commit, err := gitRepo.GetCommit(input.Ref)
+	if err != nil {
+		return fmt.Errorf("gitRepo.GetCommit: %w", err)
+	}
+
+	err = commit.LoadBranchName()
+	if err != nil {
+		return fmt.Errorf("commit.GetBranchName: %w", err)
+	}
+
+	workflows, schedules, err := actions_module.DetectWorkflows(commit, input.Event)
+	if err != nil {
+		return fmt.Errorf("DetectWorkflows: %w", err)
+	}
+
+	if err := handleSchedules(ctx, schedules, commit, input); err != nil {
+		log.Error("handle schedules: %v", err)
+	}
+
+	if err := handleWorkflows(ctx, workflows, commit, input); err != nil {
+		log.Error("handle workflows: %v", err)
+	}
+
 	return nil
 }
 

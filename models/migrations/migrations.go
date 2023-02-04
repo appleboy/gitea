@@ -455,6 +455,8 @@ var migrations = []Migration{
 	NewMigration("Add scope for access_token", v1_19.AddScopeForAccessTokens),
 	// v240 -> v241
 	NewMigration("Add actions tables", v1_19.AddActionsTables),
+	// v241 -> v242
+	NewMigration("Add action schedule table", v1_19.AddActionScheduleTable),
 }
 
 // GetCurrentDBVersion returns the current db version
